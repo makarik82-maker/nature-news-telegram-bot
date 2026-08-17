@@ -1,17 +1,17 @@
-name: RSS Nature News to Telegram
+name: WWF Stories to Telegram
 
 on:
   schedule:
-    # Запуск каждый день в 15:00 UTC (18:00 МСК) - чтобы не пересекаться с утренним NASA
+    # Запуск каждый день в 15:00 UTC (18:00 МСК)
     - cron: '0 15 * * *'
-  workflow_dispatch: # Ручной запуск
+  workflow_dispatch:
 
 permissions:
   contents: read
   actions: write
 
 jobs:
-  send-rss-news:
+  send-wwf-news:
     runs-on: ubuntu-latest
     
     steps:
@@ -28,7 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       
-      - name: Run RSS to Telegram bot
+      - name: Run WWF RSS to Telegram bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
