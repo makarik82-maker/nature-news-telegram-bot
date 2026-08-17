@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import logging
 import asyncio
@@ -20,18 +21,16 @@ TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
 
-# RSS-ленты (можно добавлять свои)
-RSS_FEEDS = [
-    "https://www.sciencedaily.com/rss/earth_environment.xml",  # ScienceDaily: Земля и окружающая среда
-    "https://earthobservatory.nasa.gov/feeds/earthobservatory.rdf", # NASA Earth Observatory
-    "https://www.nationalgeographic.com/environment/rss" # NatGeo Environment (если доступен)
-]
+#  Единственный источник — WWF Stories
+RSS_FEED_URL = "https://www.worldwildlife.org/stories/rss"
 
-STATE_VAR_NAME = "LAST_SENT_RSS_LINK"
+STATE_VAR_NAME = "LAST_SENT_WWF_LINK"
 translator = GoogleTranslator(source='auto', target='ru')
+
 
 # ==================== УПРАВЛЕНИЕ СОСТОЯНИЕМ ====================
 def get_last_sent_link():
+    """Получает ссылку последней отправленной новости из переменных GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         return ""
     url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables/{STATE_VAR_NAME}"
@@ -42,10 +41,12 @@ def get_last_sent_link():
             return response.json()["value"]
         return ""
     except Exception as e:
-        logger.warning(f"⚠️ Не удалось получить последнюю ссылку: {e}")
+        logger.warning(f"️ Не удалось получить последнюю ссылку: {e}")
         return ""
 
+
 def set_last_sent_link(link):
+    """Сохраняет ссылку отправленной новости в переменные GitHub"""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         return
     url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables/{STATE_VAR_NAME}"
@@ -60,97 +61,142 @@ def set_last_sent_link(link):
     except Exception as e:
         logger.error(f"❌ Не удалось сохранить ссылку: {e}")
 
-# ==================== ОСНОВНАЯ ЛОГИКА ====================
+
+# ==================== ОБРАБОТКА RSS ====================
 def extract_image(entry):
-    """Пытается найти изображение в записи RSS"""
+    """Пытается найти изображение в записи RSS WWF"""
     # Вариант 1: media:content
     if 'media_content' in entry and len(entry.media_content) > 0:
         return entry.media_content[0].get('url')
     # Вариант 2: enclosure
     if 'enclosures' in entry and len(entry.enclosures) > 0:
         return entry.enclosures[0].get('href')
-    # Вариант 3: извлечение из summary (простой regex для img src)
-    import re
+    # Вариант 3: извлечение из summary (тег <img>)
     match = re.search(r'<img[^>]+src="([^">]+)"', entry.get('summary', ''))
     if match:
         return match.group(1)
+    # Вариант 4: WWF часто использует media:thumbnail
+    if 'media_thumbnail' in entry and len(entry.media_thumbnail) > 0:
+        return entry.media_thumbnail[0].get('url')
     return None
 
-def process_rss():
+
+def clean_html(text):
+    """Очищает текст от HTML-тегов"""
+    clean = re.sub('<.*?>', '', text)
+    # Убираем лишние пробелы и переносы строк
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    return clean
+
+
+def process_wwf_rss():
+    """Основная функция обработки RSS-ленты WWF Stories"""
     last_link = get_last_sent_link()
     logger.info(f"🔍 Последняя отправленная ссылка: {last_link or 'Нет'}")
 
-    for feed_url in RSS_FEEDS:
-        logger.info(f"📡 Проверка ленты: {feed_url}")
-        try:
-            feed = feedparser.parse(feed_url)
-            if not feed.entries:
-                continue
+    logger.info(f"📡 Проверка ленты WWF Stories: {RSS_FEED_URL}")
+    
+    try:
+        feed = feedparser.parse(RSS_FEED_URL)
+        
+        if not feed.entries:
+            logger.warning("⚠️ Лента WWF пуста или недоступна.")
+            return False
 
-            for entry in feed.entries:
-                link = entry.get('link', '')
-                
-                # Если мы уже отправляли эту ссылку, значит и все следующие в этой ленте тоже старые
-                if link == last_link or not link:
-                    logger.info("✅ Достигли уже отправленных новостей. Останавливаемся.")
-                    return True
+        logger.info(f"📰 Найдено записей в ленте: {len(feed.entries)}")
 
-                # Обрабатываем новую новость
-                title = entry.get('title', 'Без заголовка')
-                summary = entry.get('summary', entry.get('description', 'Нет описания'))
-                
-                # Очищаем summary от HTML-тегов для перевода
-                import re
-                clean_summary = re.sub('<.*?>', '', summary)[:1000] # Ограничиваем длину для перевода
+        for entry in feed.entries:
+            link = entry.get('link', '')
+            
+            # Если мы уже отправляли эту ссылку — останавливаемся
+            if link == last_link or not link:
+                logger.info("✅ Достигли уже отправленных новостей. Останавливаемся.")
+                return True
 
-                logger.info(f"📰 Найдена новая новость: {title}")
+            # Обрабатываем новую новость
+            title = entry.get('title', 'Без заголовка')
+            summary = entry.get('summary', entry.get('description', 'Нет описания'))
+            
+            # Очищаем summary от HTML-тегов
+            clean_summary = clean_html(summary)
+            
+            # Ограничиваем длину для перевода (Google Translate имеет лимит ~5000 символов)
+            if len(clean_summary) > 4000:
+                clean_summary = clean_summary[:4000]
 
-                # Перевод
+            logger.info(f"📰 Найдена новая новость: {title}")
+
+            # Перевод на русский
+            try:
                 title_ru = translator.translate(title) if len(title) > 5 else title
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка перевода заголовка: {e}. Используем оригинал.")
+                title_ru = title
+
+            try:
                 summary_ru = translator.translate(clean_summary) if len(clean_summary) > 10 else clean_summary
+            except Exception as e:
+                logger.warning(f"️ Ошибка перевода описания: {e}. Используем оригинал.")
+                summary_ru = clean_summary
 
-                # Формируем текст
-                caption = f"🌿 <b>Новости природы и науки</b>\n\n"
-                caption += f"<b>{title_ru}</b>\n\n"
-                caption += f"{summary_ru}\n\n"
-                caption += f"🔗 <a href='{link}'>Читать оригинал</a>"
+            logger.info(f"✅ Перевод выполнен: {title_ru}")
 
-                # Обрезаем, если слишком длинно для Telegram (лимит 1024 для фото, 4096 для текста)
-                if len(caption) > 1000:
-                    caption = caption[:1000].rsplit(' ', 1)[0] + "...\n\n🔗 <a href='" + link + "'>Читать оригинал</a>"
+            # Формируем текст поста
+            caption_parts = [
+                "🐼 <b>WWF: Истории о дикой природе</b>",
+                "",
+                f"<b>{title_ru}</b>",
+                "",
+                summary_ru,
+                "",
+                f"🔗 <a href='{link}'>Читать оригинал на сайте WWF</a>"
+            ]
+            
+            caption = "\n".join(caption_parts)
 
-                image_url = extract_image(entry)
+            # Защита от превышения лимита Telegram (1024 символа для фото, 4096 для текста)
+            max_len = 1000  # С запасом для фото
+            if len(caption) > max_len:
+                # Обрезаем по последнему пробелу
+                caption = caption[:max_len].rsplit(' ', 1)[0] + "..."
+                caption += f"\n\n <a href='{link}'>Читать оригинал</a>"
 
-                # Отправка в Telegram
-                try:
-                    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-                    if image_url:
-                        asyncio.run(bot.send_photo(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            photo=image_url,
-                            caption=caption,
-                            parse_mode='HTML'
-                        ))
-                    else:
-                        asyncio.run(bot.send_message(
-                            chat_id=TELEGRAM_CHANNEL_ID,
-                            text=caption,
-                            parse_mode='HTML'
-                        ))
-                    
-                    logger.info("✅ Новость успешно отправлена в Telegram")
-                    set_last_sent_link(link)
-                    return True # Отправляем только одну новость за запуск, чтобы не спамить
+            # Ищем изображение
+            image_url = extract_image(entry)
 
-                except TelegramError as e:
-                    logger.error(f"❌ Ошибка Telegram: {e}")
-                    return False
+            # Отправка в Telegram
+            try:
+                bot = Bot(token=TELEGRAM_BOT_TOKEN)
+                
+                if image_url:
+                    logger.info(f"️ Найдено изображение: {image_url[:50]}...")
+                    asyncio.run(bot.send_photo(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        photo=image_url,
+                        caption=caption,
+                        parse_mode='HTML'
+                    ))
+                else:
+                    logger.info(" Изображение не найдено, отправляем текст")
+                    asyncio.run(bot.send_message(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        text=caption,
+                        parse_mode='HTML'
+                    ))
+                
+                logger.info("✅ Новость WWF успешно отправлена в Telegram")
+                set_last_sent_link(link)
+                return True  # Отправляем только одну новость за запуск
 
-        except Exception as e:
-            logger.error(f"❌ Ошибка при парсинге {feed_url}: {e}")
-            continue
+            except TelegramError as e:
+                logger.error(f"❌ Ошибка Telegram: {e}")
+                return False
 
-    logger.warning("⚠️ Новых новостей не найдено или все ленты недоступны.")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при парсинге ленты WWF: {e}")
+        return False
+
+    logger.warning("⚠️ Новых новостей не найдено.")
     return True
 
 
@@ -159,5 +205,5 @@ if __name__ == '__main__':
         logger.error("❌ Не все переменные окружения установлены")
         exit(1)
     
-    success = process_rss()
+    success = process_wwf_rss()
     exit(0 if success else 1)
