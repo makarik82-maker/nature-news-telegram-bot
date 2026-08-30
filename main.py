@@ -1,18 +1,16 @@
 import os
-import re
-import requests
 import logging
 import asyncio
+import requests
 import feedparser
+from bs4 import BeautifulSoup
 from telegram import Bot
 from telegram.error import TelegramError
-from deep_translator import GoogleTranslator
+from gigachat import GigaChat
+from gigachat.models import Chat, Messages, MessagesRole
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Конфигурация
@@ -20,260 +18,211 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
+GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS') # Авторизация в GigaChat
 
-# RSS-источники (в порядке ротации, WWF удален, NASA обновлен)
+# RSS-источники
 RSS_FEEDS = [
-    {
-        'name': 'Mongabay',
-        'url': 'https://news.mongabay.com/feed/',
-        'emoji': '🌿',
-        'title': 'Mongabay: Охрана природы'
-    },
-    {
-        'name': 'NASA Science',
-        'url': 'https://science.nasa.gov/feed/?science_org=22414%2C19791',
-        'emoji': '🚀',
-        'title': 'NASA Science: Новости космоса и Земли'
-    },
-    {
-        'name': 'The Guardian Environment',
-        'url': 'https://www.theguardian.com/environment/rss',
-        'emoji': '🌍',
-        'title': 'The Guardian: Окружающая среда'
-    }
+    {'name': 'Mongabay', 'url': 'https://news.mongabay.com/feed/', 'emoji': '🌿', 'title': 'Mongabay: Охрана природы'},
+    {'name': 'NASA Science', 'url': 'https://science.nasa.gov/feed/?science_org=22414%2C19791', 'emoji': '🚀', 'title': 'NASA Science: Новости космоса и Земли'},
+    {'name': 'The Guardian Environment', 'url': 'https://www.theguardian.com/environment/rss', 'emoji': '🌍', 'title': 'The Guardian: Окружающая среда'}
 ]
 
 STATE_VAR_SOURCE = "LAST_RSS_SOURCE_INDEX"
 STATE_VAR_LINK = "LAST_SENT_NATURE_LINK"
-translator = GoogleTranslator(source='auto', target='ru')
 
-# ==================== УПРАВЛЕНИЕ СОСТОЯНИЕМ ====================
+# ==================== УПРАВЛЕНИЕ СОСТОЯНИЕМ (GitHub Variables) ====================
 def get_github_variable(var_name):
-    """Получить значение переменной из GitHub"""
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        return ""
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY: return ""
     url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables/{var_name}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            return response.json()["value"]
-        return ""
+        return response.json()["value"] if response.status_code == 200 else ""
     except Exception as e:
-        logger.warning(f"⚠️ Не удалось получить переменную {var_name}: {e}")
+        logger.warning(f"⚠️ Не удалось получить {var_name}: {e}")
         return ""
 
 def set_github_variable(var_name, value):
-    """Сохранить значение переменной в GitHub"""
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        return
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY: return
     url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables/{var_name}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     data = {"name": var_name, "value": value}
     try:
         response = requests.patch(url, headers=headers, json=data, timeout=10)
-        if response.status_code == 404:
-            create_url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables"
-            requests.post(create_url, headers=headers, json=data, timeout=10)
-        logger.info(f"💾 Сохранено: {var_name} = {value}")
+        if response.status_code == 404: # Создаем, если не существует
+            requests.post(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables", headers=headers, json=data, timeout=10)
     except Exception as e:
         logger.error(f"❌ Не удалось сохранить {var_name}: {e}")
 
-def get_next_source_index():
-    """Определить индекс следующего источника (ротация)"""
-    last_index_str = get_github_variable(STATE_VAR_SOURCE)
-    try:
-        last_index = int(last_index_str)
-        next_index = (last_index + 1) % len(RSS_FEEDS)
-    except (ValueError, TypeError):
-        next_index = 0
-    return next_index
+# ==================== ОБРАБОТКА ТЕКСТА ЧЕРЕЗ GIGACHAT ====================
+def process_with_gigachat(title, summary):
+    """
+    Переводит и сжимает текст через GigaChat.
+    Возвращает кортеж (ru_title, ru_summary) или (None, None) при ошибке.
+    """
+    if not GIGACHAT_CREDENTIALS:
+        logger.error("❌ Отсутствует GIGACHAT_CREDENTIALS")
+        return None, None
 
-# ==================== БЕЗОПАСНЫЙ ПЕРЕВОД ====================
-def safe_translate(text, translator_obj):
-    """Переводит текст, но возвращает оригинал, если Google Translate вернул ошибку 500"""
-    if not text or len(text.strip()) < 5:
-        return text
-    
+    prompt = f"""Ты - профессиональный редактор новостного Telegram-канала.
+Твоя задача: перевести заголовок и описание статьи с английского на русский язык, а также сжать описание.
+Требования:
+1. Сохрани главную мысль, ключевые факты и цифры. Ничего не придумывай от себя.
+2. Итоговый текст (вместе с заголовком) должен занимать СТРОГО до 750 символов (с пробелами).
+3. Стиль: информационный, без воды и вступлений.
+4. Ответ верни СТРОГО в следующем формате, где первая строка — заголовок, а всё остальное — основной текст:
+[ЗАГОЛОВОК]
+[ОПИСАНИЕ]
+
+Оригинальный заголовок: {title}
+Оригинальное описание: {summary}
+"""
     try:
-        translated = translator_obj.translate(text)
-        
-        # Проверка на специфическую ошибку Google Translate
-        error_markers = ["Error 500", "That’s an error", "That’s all we know"]
-        if all(marker in translated for marker in error_markers):
-            logger.warning("⚠️ Обнаружена ошибка перевода (Error 500). Публикуем оригинальный текст.")
-            return text
+        # verify_ssl_certs=False часто требуется в CI/CD из-за корневых сертификатов Сбера
+        with GigaChat(credentials=GIGACHAT_CREDENTIALS, scope="GIGACHAT_API_PERS", verify_ssl_certs=False) as giga:
+            response = giga.chat(
+                Chat(
+                    messages=[Messages(role=MessagesRole.USER, content=prompt)],
+                    model="GigaChat:latest"
+                )
+            )
+            result = response.choices[0].message.content.strip()
             
-        return translated
+            # Парсим ответ нейросети
+            parts = result.split('\n', 1)
+            ru_title = parts[0].strip()
+            ru_summary = parts[1].strip() if len(parts) > 1 else ru_title
+            
+            # Жесткая страховка от превышения 800 символов суммарно
+            full_text = f"{ru_title}\n\n{ru_summary}"
+            if len(full_text) > 780:
+                max_summary_len = 780 - len(ru_title) - 4
+                if max_summary_len > 0:
+                    ru_summary = ru_summary[:max_summary_len].rsplit(' ', 1)[0] + "..."
+                else:
+                    ru_summary = ""
+                    
+            return ru_title, ru_summary
+            
     except Exception as e:
-        logger.warning(f"⚠️ Ошибка перевода: {e}. Используем оригинальный текст.")
-        return text
+        logger.error(f"❌ Ошибка GigaChat: {e}")
+        return None, None
 
-# ==================== ОБРАБОТКА RSS ====================
+def clean_html(raw_html):
+    if not raw_html: return ""
+    soup = BeautifulSoup(raw_html, "lxml")
+    return soup.get_text(separator=' ', strip=True)
+
 def extract_image(entry):
-    """Пытается найти изображение в записи RSS"""
-    if 'media_content' in entry and len(entry.media_content) > 0:
-        return entry.media_content[0].get('url')
-    if 'enclosures' in entry and len(entry.enclosures) > 0:
-        return entry.enclosures[0].get('href')
-    if 'media_thumbnail' in entry and len(entry.media_thumbnail) > 0:
-        return entry.media_thumbnail[0].get('url')
-    
-    match = re.search(r'<img[^>]+src="([^">]+)"', entry.get('summary', ''))
-    if match:
-        return match.group(1)
+    if 'media_content' in entry: return entry.media_content[0].get('url')
+    if 'enclosures' in entry: return entry.enclosures[0].get('url')
     return None
 
-def clean_html(text):
-    """Очищает текст от HTML-тегов"""
-    clean = re.sub('<.*?>', '', text)
-    clean = re.sub(r'\s+', ' ', clean).strip()
-    return clean
-
+# ==================== ОБРАБОТКА RSS ====================
 def process_rss_feed(feed_info):
-    """Обработать одну RSS-ленту и вернуть первую новую новость"""
+    """Обрабатывает одну ленту. Возвращает готовый контент или None."""
     last_link = get_github_variable(STATE_VAR_LINK)
-    logger.info(f"🔍 Последняя отправленная ссылка: {last_link or 'Нет'}")
-    
-    feed_url = feed_info['url']
-    feed_name = feed_info['name']
-    logger.info(f"📡 Проверка ленты {feed_name}: {feed_url}")
+    logger.info(f"📡 Проверка ленты {feed_info['name']}")
     
     try:
-        feed = feedparser.parse(feed_url)
-        
-        if not feed.entries:
-            logger.warning(f"⚠️ Лента {feed_name} пуста или недоступна.")
-            return None
-
-        logger.info(f"📰 Найдено записей в ленте {feed_name}: {len(feed.entries)}")
+        feed = feedparser.parse(feed_info['url'])
+        if not feed.entries: return None
 
         for entry in feed.entries:
             link = entry.get('link', '')
+            if link == last_link or not link: 
+                continue # Пропускаем уже отправленные
             
-            if link == last_link or not link:
-                logger.info(f"✅ Достигли уже отправленных новостей в {feed_name}.")
-                return None
-
             title = entry.get('title', 'Без заголовка')
-            summary = entry.get('summary', entry.get('description', 'Нет описания'))
+            summary = clean_html(entry.get('summary', entry.get('description', '')))
             
-            clean_summary = clean_html(summary)
+            # Обработка через Gigachat (Перевод + Суммаризация)
+            ru_title, ru_summary = process_with_gigachat(title, summary)
             
-            if len(clean_summary) > 4000:
-                clean_summary = clean_summary[:4000]
+            if not ru_title or not ru_summary:
+                logger.warning(f"⚠️ GigaChat не смог обработать новость '{title}'. Пробуем следующую в ленте.")
+                continue # Переходим к следующей новости в этой же ленте
 
-            logger.info(f"🆕 Найдена новая новость: {title}")
-
-            # Используем безопасный перевод
-            title_ru = safe_translate(title, translator) if len(title) > 5 else title
-            summary_ru = safe_translate(clean_summary, translator) if len(clean_summary) > 10 else clean_summary
-
-            logger.info(f"✅ Перевод выполнен (или использован оригинал): {title_ru}")
-
+            # Формирование финального поста
             caption_parts = [
                 f"{feed_info['emoji']} <b>{feed_info['title']}</b>",
                 "",
-                f"<b>{title_ru}</b>",
+                f"<b>{ru_title}</b>",
                 "",
-                summary_ru,
+                ru_summary,
                 "",
                 f"🔗 <a href='{link}'>Читать оригинал</a>"
             ]
-            
             caption = "\n".join(caption_parts)
-
-            max_len = 1000
-            if len(caption) > max_len:
-                caption = caption[:max_len].rsplit(' ', 1)[0] + "..."
-                caption += f"\n\n🔗 <a href='{link}'>Читать оригинал</a>"
-
+            
             image_url = extract_image(entry)
-
             return {
                 'type': 'photo' if image_url else 'text',
                 'url': image_url,
                 'caption': caption,
                 'link': link
             }
-
+            
     except Exception as e:
-        logger.error(f"❌ Ошибка при парсинге ленты {feed_name}: {e}")
-        return None
-
+        logger.error(f"❌ Ошибка парсинга {feed_info['name']}: {e}")
+        
     return None
 
 def send_to_telegram(content):
-    """Отправить контент в Telegram"""
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        
         if content['type'] == 'photo' and content['url']:
-            logger.info(f"🖼️ Найдено изображение, отправка фото...")
-            asyncio.run(bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                photo=content['url'],
-                caption=content['caption'],
-                parse_mode='HTML'
-            ))
+            asyncio.run(bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=content['url'], caption=content['caption'], parse_mode='HTML'))
         else:
-            logger.info("📝 Изображение не найдено, отправка текста...")
-            asyncio.run(bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                text=content['caption'],
-                parse_mode='HTML'
-            ))
-        
-        logger.info("✅ Новость успешно отправлена в Telegram")
+            asyncio.run(bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=content['caption'], parse_mode='HTML'))
         return True
-        
     except TelegramError as e:
         logger.error(f"❌ Ошибка Telegram: {e}")
         return False
 
+# ==================== ГЛАВНАЯ ЛОГИКА ====================
 def main():
-    logger.info("🚀 Запуск бота природы (ротация 4 источников)")
-    
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID]):
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, GIGACHAT_CREDENTIALS]):
         logger.error("❌ Не все переменные окружения установлены")
         return False
-    
-    source_index = get_next_source_index()
-    feed_info = RSS_FEEDS[source_index]
-    logger.info(f"🎯 Выбран источник: {feed_info['name']} ({source_index + 1}/{len(RSS_FEEDS)})")
-    
-    content = process_rss_feed(feed_info)
-    
-    if not content:
-        logger.warning(f"⚠️ Не удалось получить новость из {feed_info['name']}. Пробуем следующий источник...")
+
+    # 1. Читаем последний успешный индекс
+    last_index_str = get_github_variable(STATE_VAR_SOURCE)
+    try:
+        last_index = int(last_index_str)
+    except (ValueError, TypeError):
+        last_index = -1 # При первом запуске начнем с индекса 0
+
+    content = None
+    chosen_index = -1
+
+    # 2. Жесткая ротация с перебором (Fallback)
+    # Цикл пройдет по всем источникам, начиная со следующего после последнего использованного
+    for i in range(len(RSS_FEEDS)):
+        next_index = (last_index + 1 + i) % len(RSS_FEEDS)
+        feed_info = RSS_FEEDS[next_index]
+        logger.info(f"🎯 Пробуем источник: {feed_info['name']} ({next_index + 1}/{len(RSS_FEEDS)})")
         
-        for i in range(1, len(RSS_FEEDS)):
-            next_index = (source_index + i) % len(RSS_FEEDS)
-            next_feed = RSS_FEEDS[next_index]
-            logger.info(f"🔄 Пробуем запасной источник: {next_feed['name']}")
-            
-            content = process_rss_feed(next_feed)
-            if content:
-                source_index = next_index
-                break
-    
+        content = process_rss_feed(feed_info)
+        if content:
+            chosen_index = next_index
+            break
+        else:
+            logger.warning(f"⚠️ Источник {feed_info['name']} не дал пригодных новостей. Переход к следующему...")
+
+    # 3. Финальная проверка
     if not content:
-        logger.warning("⚠️ Не удалось получить новости ни из одного источника.")
+        logger.error("❌ Не удалось получить и обработать новости ни из одного источника.")
         return False
-    
-    success = send_to_telegram(content)
-    
-    if success:
-        set_github_variable(STATE_VAR_SOURCE, str(source_index))
+
+    # 4. Отправка и сохранение состояния
+    if send_to_telegram(content):
+        logger.info("✅ Пост успешно опубликован. Сохраняем состояние...")
+        set_github_variable(STATE_VAR_SOURCE, str(chosen_index))
         set_github_variable(STATE_VAR_LINK, content['link'])
         return True
-    
+        
     return False
 
-if __name__ == '__main__':
-    success = main()
-    if success:
-        exit(0)
-    else:
-        logger.warning("⚠️ Завершаем работу. В следующий раз попробуем снова!")
-        exit(0)
+if __name__ == "__main__":
+    main()
