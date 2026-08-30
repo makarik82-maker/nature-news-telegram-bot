@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import requests
 import feedparser
 import json
 import subprocess
@@ -26,7 +25,9 @@ GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
 GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS')
 
 STATE_FILE = 'state.json'
-MAX_HISTORY_SIZE = 200 # Храним только последние 200 ссылок, чтобы файл не разрастался
+MAX_HISTORY_SIZE = 200      # Храним последние 200 ссылок
+MAX_POST_CHARS = 800        # Максимальная длина всего поста в Telegram
+TEXT_BUDGET = 700           # Бюджет на заголовок + описание (остальное — шапка и ссылка)
 
 # RSS-источники
 RSS_FEEDS = [
@@ -62,14 +63,12 @@ def commit_and_push():
 
         subprocess.run(['git', 'config', '--global', 'user.name', 'github-actions[bot]'], check=True)
         subprocess.run(['git', 'config', '--global', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
-        
-        # Настраиваем URL с токеном для авторизации пуша
+
         remote_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{GITHUB_REPOSITORY}.git"
         subprocess.run(['git', 'remote', 'set-url', 'origin', remote_url], check=True, capture_output=True)
-        
+
         subprocess.run(['git', 'add', STATE_FILE], check=True)
-        
-        # Проверяем, есть ли реальные изменения для коммита
+
         status = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True, check=True)
         if status.stdout.strip():
             subprocess.run(['git', 'commit', '-m', '🤖 Автоматическое обновление истории публикаций'], check=True)
@@ -80,53 +79,70 @@ def commit_and_push():
     except subprocess.CalledProcessError as e:
         logger.error(f"❌ Ошибка Git: {e}")
 
-# ==================== ОЧИСТКА ТЕКСТА ====================
+# ==================== ОЧИСТКА И ОБРЕЗКА ТЕКСТА ====================
 def clean_text(text):
     """Удаляет спецсимволы, markdown, скобки и экранирует HTML."""
     if not text: return ""
-    # Оставляем только буквы (в т.ч. кириллицу), цифры, пробелы и базовую пунктуацию.
-    # Квадратные [], фигурные {}, угловые <>, звездочки *, решетки # и т.д. будут УДАЛЕНЫ.
+    # Оставляем только буквы, цифры, пробелы и базовую пунктуацию.
+    # Квадратные [], фигурные {}, угловые <>, звездочки *, решетки # будут УДАЛЕНЫ.
     text = re.sub(r'[^\w\s\.\,\!\?\-\:\;\"\'\(\)]', '', text, flags=re.UNICODE)
-    # Схлопываем множественные пробелы и переносы строк
     text = re.sub(r'\s+', ' ', text).strip()
-    # Экранируем HTML-символы, чтобы исходный текст не ломал нашу верстку Telegram
     return html.escape(text)
+
+def truncate_by_sentence(text, max_len):
+    """Обрезает текст ТОЛЬКО по границе законченного предложения."""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len]
+    # Ищем конец последнего полного предложения
+    best = -1
+    for sep in ('. ', '! ', '? '):
+        idx = cut.rfind(sep)
+        if idx > best:
+            best = idx
+    if best > 0:
+        return cut[:best + 1].strip() + '…'
+    # Если предложений нет — режем по слову
+    return cut.rsplit(' ', 1)[0].strip() + '…'
 
 # ==================== GIGACHAT ====================
 def process_with_gigachat(title, summary):
-    """Переводит и сжимает текст через GigaChat."""
+    """Переводит и сжимает текст через GigaChat, укладываясь в лимит символов."""
     if not GIGACHAT_CREDENTIALS: return None, None
+
     prompt = f"""Ты - профессиональный редактор новостного Telegram-канала.
-Переведи заголовок и описание на русский язык и сожми описание до 700 символов.
+Переведи новость на русский язык и кратко перескажи её суть.
 Требования:
-1. Сохрани главную мысль и факты. Ничего не придумывай.
-2. Убери все спецсимволы, квадратные скобки, звездочки, markdown-разметку.
-3. Ответ верни СТРОГО в формате:
-[ЗАГОЛОВОК]
-[ОПИСАНИЕ]
+1. Ничего не придумывай, опирайся только на исходный текст.
+2. Первая строка ответа - ЗАГОЛОВОК, не длиннее 100 символов.
+3. Со второй строки - ОПИСАНИЕ, не длиннее 600 символов.
+4. Суммарный объём ответа - НЕ БОЛЕЕ {TEXT_BUDGET} символов.
+5. ОПИСАНИЕ должно заканчиваться логически завершённым предложением, без обрыва на полуслове.
+6. Без спецсимволов, квадратных скобок, звёздочек и markdown-разметки.
 
 Оригинал: {title}
 Описание: {summary}
 """
     try:
         with GigaChat(credentials=GIGACHAT_CREDENTIALS, scope="GIGACHAT_API_PERS", verify_ssl_certs=False) as giga:
-            response = giga.chat(Chat(messages=[Messages(role=MessagesRole.USER, content=prompt)], model="GigaChat:latest"))
+            response = giga.chat(Chat(
+                messages=[Messages(role=MessagesRole.USER, content=prompt)],
+                model="GigaChat:latest",
+                max_tokens=1024  # Даём модели запас, чтобы ответ НЕ обрывался по лимиту токенов
+            ))
             result = response.choices[0].message.content.strip()
-            
+
             parts = result.split('\n', 1)
-            # Жесткая очистка ответа нейросети
             ru_title = clean_text(parts[0].strip())
             ru_summary = clean_text(parts[1].strip()) if len(parts) > 1 else ru_title
-            
+
             if not ru_title or not ru_summary: return None, None
-            
-            # Страховка от превышения 800 символов суммарно
-            full_text = f"{ru_title}\n\n{ru_summary}"
-            if len(full_text) > 750:
-                max_summary_len = 750 - len(ru_title) - 4
-                if max_summary_len > 0:
-                    ru_summary = ru_summary[:max_summary_len].rsplit(' ', 1)[0] + "..."
-                    
+
+            # Страховка: укладываем описание в бюджет по границе предложения
+            budget = max(TEXT_BUDGET - len(ru_title), 100)
+            if len(ru_summary) > budget:
+                ru_summary = truncate_by_sentence(ru_summary, budget)
+
             return ru_title, ru_summary
     except Exception as e:
         logger.error(f"❌ Ошибка GigaChat: {e}\n{traceback.format_exc()}")
@@ -140,7 +156,6 @@ def clean_html(raw_html):
 def extract_image(entry):
     """Безопасное извлечение картинки из RSS-записи"""
     try:
-        # Проверяем, что списки существуют и они ТОЧНО НЕ пустые
         if entry.get('media_content') and len(entry.media_content) > 0:
             return entry.media_content[0].get('url')
         if entry.get('enclosures') and len(entry.enclosures) > 0:
@@ -169,9 +184,8 @@ def main():
 
     history = load_history()
     last_index = history.get('last_source_index', -1)
-    # Используем set для мгновенной проверки дубликатов
-    sent_links = set(history.get('sent_links', [])) 
-    
+    sent_links = set(history.get('sent_links', []))
+
     content = None
     chosen_index = -1
     new_link = ""
@@ -181,24 +195,23 @@ def main():
         next_index = (last_index + 1 + i) % len(RSS_FEEDS)
         feed_info = RSS_FEEDS[next_index]
         logger.info(f"🎯 Пробуем источник: {feed_info['name']} ({next_index + 1}/{len(RSS_FEEDS)})")
-        
+
         try:
             feed = feedparser.parse(feed_info['url'])
-            if not feed.entries: 
+            if not feed.entries:
                 logger.warning(f"⚠️ Лента {feed_info['name']} пуста.")
                 continue
 
             for entry in feed.entries:
                 link = entry.get('link', '')
-                # ГЛАВНАЯ ПРОВЕРКА: если ссылка уже в истории, пропускаем её
-                if not link or link in sent_links: 
-                    continue 
-                
+                if not link or link in sent_links:
+                    continue
+
                 title = entry.get('title', '')
                 summary = clean_html(entry.get('summary', entry.get('description', '')))
-                
+
                 ru_title, ru_summary = process_with_gigachat(title, summary)
-                if not ru_title or not ru_summary: 
+                if not ru_title or not ru_summary:
                     logger.warning(f"⚠️ GigaChat не смог обработать '{title}'. Переход к следующей новости.")
                     continue
 
@@ -212,8 +225,17 @@ def main():
                     f"🔗 <a href='{link}'>Читать оригинал</a>"
                 ]
                 caption = "\n".join(caption_parts)
+
+                # ФИНАЛЬНЫЙ КОНТРОЛЬ: весь пост не должен превышать MAX_POST_CHARS
+                if len(caption) > MAX_POST_CHARS:
+                    overflow = len(caption) - MAX_POST_CHARS
+                    ru_summary = truncate_by_sentence(ru_summary, len(ru_summary) - overflow)
+                    caption_parts[4] = ru_summary
+                    caption = "\n".join(caption_parts)
+                    logger.info(f"✂️ Пост ужат до {len(caption)} символов по границе предложения")
+
                 image_url = extract_image(entry)
-                
+
                 content = {
                     'type': 'photo' if image_url else 'text',
                     'url': image_url,
@@ -222,19 +244,18 @@ def main():
                 }
                 new_link = link
                 chosen_index = next_index
-                break # Нашли статью, выходим из цикла статей
-                
+                break
+
         except Exception as e:
             logger.error(f"❌ Ошибка парсинга {feed_info['name']}: {e}\n{traceback.format_exc()}")
-            
+
         if content:
-            break # Нашли источник, выходим из цикла источников
+            break
 
     if not content:
         logger.error("❌ Не удалось найти новые уникальные новости ни в одном источнике.")
         return False
 
-    # Публикация и сохранение
     if send_to_telegram(content):
         logger.info("✅ Пост опубликован. Обновляем историю...")
         history['last_source_index'] = chosen_index
@@ -242,7 +263,7 @@ def main():
         save_history(history)
         commit_and_push()
         return True
-        
+
     return False
 
 if __name__ == "__main__":
