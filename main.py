@@ -3,6 +3,10 @@ import logging
 import asyncio
 import requests
 import feedparser
+import json
+import subprocess
+import re
+import html
 from bs4 import BeautifulSoup
 from telegram import Bot
 from telegram.error import TelegramError
@@ -18,154 +22,120 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY')
-GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS') # Авторизация в GigaChat
+GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS')
 
-# RSS-источники
+STATE_FILE = 'state.json'
+MAX_HISTORY_SIZE = 200 # Храним только последние 200 ссылок, чтобы файл не разрастался
+
 RSS_FEEDS = [
     {'name': 'Mongabay', 'url': 'https://news.mongabay.com/feed/', 'emoji': '🌿', 'title': 'Mongabay: Охрана природы'},
     {'name': 'NASA Science', 'url': 'https://science.nasa.gov/feed/?science_org=22414%2C19791', 'emoji': '🚀', 'title': 'NASA Science: Новости космоса и Земли'},
     {'name': 'The Guardian Environment', 'url': 'https://www.theguardian.com/environment/rss', 'emoji': '🌍', 'title': 'The Guardian: Окружающая среда'}
 ]
 
-STATE_VAR_SOURCE = "LAST_RSS_SOURCE_INDEX"
-STATE_VAR_LINK = "LAST_SENT_NATURE_LINK"
+# ==================== РАБОТА С ИСТОРИЕЙ (state.json) ====================
+def load_history():
+    """Загружает историю из файла. Если файла нет - создает пустую структуру."""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Ошибка чтения {STATE_FILE}: {e}")
+    return {"last_source_index": -1, "sent_links": []}
 
-# ==================== УПРАВЛЕНИЕ СОСТОЯНИЕМ (GitHub Variables) ====================
-def get_github_variable(var_name):
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY: return ""
-    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables/{var_name}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+def save_history(data):
+    """Сохраняет историю в файл, обрезая до MAX_HISTORY_SIZE."""
+    if len(data['sent_links']) > MAX_HISTORY_SIZE:
+        data['sent_links'] = data['sent_links'][-MAX_HISTORY_SIZE:]
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def commit_and_push():
+    """Коммитит и пушит изменения state.json в репозиторий."""
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        return response.json()["value"] if response.status_code == 200 else ""
-    except Exception as e:
-        logger.warning(f"⚠️ Не удалось получить {var_name}: {e}")
-        return ""
+        if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+            logger.warning("⚠️ Нет GITHUB_TOKEN для пуша в Git")
+            return
 
-def set_github_variable(var_name, value):
-    if not GITHUB_TOKEN or not GITHUB_REPOSITORY: return
-    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables/{var_name}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    data = {"name": var_name, "value": value}
-    try:
-        response = requests.patch(url, headers=headers, json=data, timeout=10)
-        if response.status_code == 404: # Создаем, если не существует
-            requests.post(f"https://api.github.com/repos/{GITHUB_REPOSITORY}/actions/variables", headers=headers, json=data, timeout=10)
-    except Exception as e:
-        logger.error(f"❌ Не удалось сохранить {var_name}: {e}")
+        subprocess.run(['git', 'config', '--global', 'user.name', 'github-actions[bot]'], check=True)
+        subprocess.run(['git', 'config', '--global', 'user.email', 'github-actions[bot]@users.noreply.github.com'], check=True)
+        
+        # Настраиваем URL с токеном для авторизации пуша
+        remote_url = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{GITHUB_REPOSITORY}.git"
+        subprocess.run(['git', 'remote', 'set-url', 'origin', remote_url], check=True, capture_output=True)
+        
+        subprocess.run(['git', 'add', STATE_FILE], check=True)
+        
+        # Проверяем, есть ли реальные изменения для коммита
+        status = subprocess.run(['git', 'status', '--porcelain'], capture_output=True, text=True, check=True)
+        if status.stdout.strip():
+            subprocess.run(['git', 'commit', '-m', '🤖 Автоматическое обновление истории публикаций'], check=True)
+            subprocess.run(['git', 'push', 'origin', 'HEAD'], check=True)
+            logger.info("✅ История успешно сохранена в репозиторий")
+        else:
+            logger.info("ℹ️ Изменений в истории нет")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Ошибка Git: {e}")
 
-# ==================== ОБРАБОТКА ТЕКСТА ЧЕРЕЗ GIGACHAT ====================
+# ==================== ОЧИСТКА ТЕКСТА ====================
+def clean_text(text):
+    """Удаляет спецсимволы, markdown, скобки и экранирует HTML."""
+    if not text: return ""
+    # Оставляем только буквы (в т.ч. кириллицу), цифры, пробелы и базовую пунктуацию.
+    # Квадратные [], фигурные {}, угловые <>, звездочки *, решетки # и т.д. будут УДАЛЕНЫ.
+    text = re.sub(r'[^\w\s\.\,\!\?\-\:\;\"\'\(\)]', '', text, flags=re.UNICODE)
+    # Схлопываем множественные пробелы и переносы строк
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Экранируем HTML-символы, чтобы исходный текст не ломал нашу верстку Telegram
+    return html.escape(text)
+
+# ==================== GIGACHAT И RSS ====================
 def process_with_gigachat(title, summary):
-    """
-    Переводит и сжимает текст через GigaChat.
-    Возвращает кортеж (ru_title, ru_summary) или (None, None) при ошибке.
-    """
-    if not GIGACHAT_CREDENTIALS:
-        logger.error("❌ Отсутствует GIGACHAT_CREDENTIALS")
-        return None, None
-
+    if not GIGACHAT_CREDENTIALS: return None, None
     prompt = f"""Ты - профессиональный редактор новостного Telegram-канала.
-Твоя задача: перевести заголовок и описание статьи с английского на русский язык, а также сжать описание.
+Переведи заголовок и описание на русский язык и сожми описание до 700 символов.
 Требования:
-1. Сохрани главную мысль, ключевые факты и цифры. Ничего не придумывай от себя.
-2. Итоговый текст (вместе с заголовком) должен занимать СТРОГО до 750 символов (с пробелами).
-3. Стиль: информационный, без воды и вступлений.
-4. Ответ верни СТРОГО в следующем формате, где первая строка — заголовок, а всё остальное — основной текст:
+1. Сохрани главную мысль и факты. Ничего не придумывай.
+2. Убери все спецсимволы, квадратные скобки, звездочки, markdown-разметку.
+3. Ответ верни СТРОГО в формате:
 [ЗАГОЛОВОК]
 [ОПИСАНИЕ]
 
-Оригинальный заголовок: {title}
-Оригинальное описание: {summary}
+Оригинал: {title}
+Описание: {summary}
 """
     try:
-        # verify_ssl_certs=False часто требуется в CI/CD из-за корневых сертификатов Сбера
         with GigaChat(credentials=GIGACHAT_CREDENTIALS, scope="GIGACHAT_API_PERS", verify_ssl_certs=False) as giga:
-            response = giga.chat(
-                Chat(
-                    messages=[Messages(role=MessagesRole.USER, content=prompt)],
-                    model="GigaChat:latest"
-                )
-            )
+            response = giga.chat(Chat(messages=[Messages(role=MessagesRole.USER, content=prompt)], model="GigaChat:latest"))
             result = response.choices[0].message.content.strip()
             
-            # Парсим ответ нейросети
             parts = result.split('\n', 1)
-            ru_title = parts[0].strip()
-            ru_summary = parts[1].strip() if len(parts) > 1 else ru_title
+            # Жесткая очистка ответа нейросети
+            ru_title = clean_text(parts[0].strip())
+            ru_summary = clean_text(parts[1].strip()) if len(parts) > 1 else ru_title
             
-            # Жесткая страховка от превышения 800 символов суммарно
+            if not ru_title or not ru_summary: return None, None
+            
+            # Страховка от превышения 800 символов суммарно
             full_text = f"{ru_title}\n\n{ru_summary}"
-            if len(full_text) > 780:
-                max_summary_len = 780 - len(ru_title) - 4
+            if len(full_text) > 750:
+                max_summary_len = 750 - len(ru_title) - 4
                 if max_summary_len > 0:
                     ru_summary = ru_summary[:max_summary_len].rsplit(' ', 1)[0] + "..."
-                else:
-                    ru_summary = ""
                     
             return ru_title, ru_summary
-            
     except Exception as e:
         logger.error(f"❌ Ошибка GigaChat: {e}")
         return None, None
 
 def clean_html(raw_html):
     if not raw_html: return ""
-    soup = BeautifulSoup(raw_html, "lxml")
-    return soup.get_text(separator=' ', strip=True)
+    return BeautifulSoup(raw_html, "lxml").get_text(separator=' ', strip=True)
 
 def extract_image(entry):
     if 'media_content' in entry: return entry.media_content[0].get('url')
     if 'enclosures' in entry: return entry.enclosures[0].get('url')
-    return None
-
-# ==================== ОБРАБОТКА RSS ====================
-def process_rss_feed(feed_info):
-    """Обрабатывает одну ленту. Возвращает готовый контент или None."""
-    last_link = get_github_variable(STATE_VAR_LINK)
-    logger.info(f"📡 Проверка ленты {feed_info['name']}")
-    
-    try:
-        feed = feedparser.parse(feed_info['url'])
-        if not feed.entries: return None
-
-        for entry in feed.entries:
-            link = entry.get('link', '')
-            if link == last_link or not link: 
-                continue # Пропускаем уже отправленные
-            
-            title = entry.get('title', 'Без заголовка')
-            summary = clean_html(entry.get('summary', entry.get('description', '')))
-            
-            # Обработка через Gigachat (Перевод + Суммаризация)
-            ru_title, ru_summary = process_with_gigachat(title, summary)
-            
-            if not ru_title or not ru_summary:
-                logger.warning(f"⚠️ GigaChat не смог обработать новость '{title}'. Пробуем следующую в ленте.")
-                continue # Переходим к следующей новости в этой же ленте
-
-            # Формирование финального поста
-            caption_parts = [
-                f"{feed_info['emoji']} <b>{feed_info['title']}</b>",
-                "",
-                f"<b>{ru_title}</b>",
-                "",
-                ru_summary,
-                "",
-                f"🔗 <a href='{link}'>Читать оригинал</a>"
-            ]
-            caption = "\n".join(caption_parts)
-            
-            image_url = extract_image(entry)
-            return {
-                'type': 'photo' if image_url else 'text',
-                'url': image_url,
-                'caption': caption,
-                'link': link
-            }
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка парсинга {feed_info['name']}: {e}")
-        
     return None
 
 def send_to_telegram(content):
@@ -186,40 +156,76 @@ def main():
         logger.error("❌ Не все переменные окружения установлены")
         return False
 
-    # 1. Читаем последний успешный индекс
-    last_index_str = get_github_variable(STATE_VAR_SOURCE)
-    try:
-        last_index = int(last_index_str)
-    except (ValueError, TypeError):
-        last_index = -1 # При первом запуске начнем с индекса 0
-
+    history = load_history()
+    last_index = history.get('last_source_index', -1)
+    # Используем set для мгновенной проверки дубликатов
+    sent_links = set(history.get('sent_links', [])) 
+    
     content = None
     chosen_index = -1
+    new_link = ""
 
-    # 2. Жесткая ротация с перебором (Fallback)
-    # Цикл пройдет по всем источникам, начиная со следующего после последнего использованного
+    # Жесткая ротация с проверкой истории
     for i in range(len(RSS_FEEDS)):
         next_index = (last_index + 1 + i) % len(RSS_FEEDS)
         feed_info = RSS_FEEDS[next_index]
         logger.info(f"🎯 Пробуем источник: {feed_info['name']} ({next_index + 1}/{len(RSS_FEEDS)})")
         
-        content = process_rss_feed(feed_info)
-        if content:
-            chosen_index = next_index
-            break
-        else:
-            logger.warning(f"⚠️ Источник {feed_info['name']} не дал пригодных новостей. Переход к следующему...")
+        try:
+            feed = feedparser.parse(feed_info['url'])
+            if not feed.entries: continue
 
-    # 3. Финальная проверка
+            for entry in feed.entries:
+                link = entry.get('link', '')
+                # ГЛАВНАЯ ПРОВЕРКА: если ссылка уже в истории, пропускаем её
+                if not link or link in sent_links: 
+                    continue 
+                
+                title = entry.get('title', '')
+                summary = clean_html(entry.get('summary', entry.get('description', '')))
+                
+                ru_title, ru_summary = process_with_gigachat(title, summary)
+                if not ru_title or not ru_summary: continue
+
+                caption_parts = [
+                    f"{feed_info['emoji']} <b>{feed_info['title']}</b>",
+                    "",
+                    f"<b>{ru_title}</b>",
+                    "",
+                    ru_summary,
+                    "",
+                    f"🔗 <a href='{link}'>Читать оригинал</a>"
+                ]
+                caption = "\n".join(caption_parts)
+                image_url = extract_image(entry)
+                
+                content = {
+                    'type': 'photo' if image_url else 'text',
+                    'url': image_url,
+                    'caption': caption,
+                    'link': link
+                }
+                new_link = link
+                chosen_index = next_index
+                break # Нашли статью, выходим из цикла статей
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка парсинга {feed_info['name']}: {e}")
+            
+        if content:
+            break # Нашли источник, выходим из цикла источников
+
     if not content:
-        logger.error("❌ Не удалось получить и обработать новости ни из одного источника.")
+        logger.error("❌ Не удалось найти новые уникальные новости ни в одном источнике.")
         return False
 
-    # 4. Отправка и сохранение состояния
+    # Публикация и сохранение
     if send_to_telegram(content):
-        logger.info("✅ Пост успешно опубликован. Сохраняем состояние...")
-        set_github_variable(STATE_VAR_SOURCE, str(chosen_index))
-        set_github_variable(STATE_VAR_LINK, content['link'])
+        logger.info("✅ Пост опубликован. Обновляем историю...")
+        history['last_source_index'] = chosen_index
+        history['sent_links'].append(new_link)
+        save_history(history)
+        commit_and_push()
         return True
         
     return False
