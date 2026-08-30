@@ -7,6 +7,7 @@ import json
 import subprocess
 import re
 import html
+import traceback
 from bs4 import BeautifulSoup
 from telegram import Bot
 from telegram.error import TelegramError
@@ -17,7 +18,7 @@ from gigachat.models import Chat, Messages, MessagesRole
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Конфигурация
+# Конфигурация окружения
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHANNEL_ID = os.getenv('TELEGRAM_CHANNEL_ID')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
@@ -27,6 +28,7 @@ GIGACHAT_CREDENTIALS = os.getenv('GIGACHAT_CREDENTIALS')
 STATE_FILE = 'state.json'
 MAX_HISTORY_SIZE = 200 # Храним только последние 200 ссылок, чтобы файл не разрастался
 
+# RSS-источники
 RSS_FEEDS = [
     {'name': 'Mongabay', 'url': 'https://news.mongabay.com/feed/', 'emoji': '🌿', 'title': 'Mongabay: Охрана природы'},
     {'name': 'NASA Science', 'url': 'https://science.nasa.gov/feed/?science_org=22414%2C19791', 'emoji': '🚀', 'title': 'NASA Science: Новости космоса и Земли'},
@@ -90,8 +92,9 @@ def clean_text(text):
     # Экранируем HTML-символы, чтобы исходный текст не ломал нашу верстку Telegram
     return html.escape(text)
 
-# ==================== GIGACHAT И RSS ====================
+# ==================== GIGACHAT ====================
 def process_with_gigachat(title, summary):
+    """Переводит и сжимает текст через GigaChat."""
     if not GIGACHAT_CREDENTIALS: return None, None
     prompt = f"""Ты - профессиональный редактор новостного Telegram-канала.
 Переведи заголовок и описание на русский язык и сожми описание до 700 символов.
@@ -126,16 +129,24 @@ def process_with_gigachat(title, summary):
                     
             return ru_title, ru_summary
     except Exception as e:
-        logger.error(f"❌ Ошибка GigaChat: {e}")
+        logger.error(f"❌ Ошибка GigaChat: {e}\n{traceback.format_exc()}")
         return None, None
 
+# ==================== ОБРАБОТКА RSS ====================
 def clean_html(raw_html):
     if not raw_html: return ""
     return BeautifulSoup(raw_html, "lxml").get_text(separator=' ', strip=True)
 
 def extract_image(entry):
-    if 'media_content' in entry: return entry.media_content[0].get('url')
-    if 'enclosures' in entry: return entry.enclosures[0].get('url')
+    """Безопасное извлечение картинки из RSS-записи"""
+    try:
+        # Проверяем, что списки существуют и они ТОЧНО НЕ пустые
+        if entry.get('media_content') and len(entry.media_content) > 0:
+            return entry.media_content[0].get('url')
+        if entry.get('enclosures') and len(entry.enclosures) > 0:
+            return entry.enclosures[0].get('url')
+    except (IndexError, KeyError, TypeError, AttributeError):
+        pass
     return None
 
 def send_to_telegram(content):
@@ -147,7 +158,7 @@ def send_to_telegram(content):
             asyncio.run(bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=content['caption'], parse_mode='HTML'))
         return True
     except TelegramError as e:
-        logger.error(f"❌ Ошибка Telegram: {e}")
+        logger.error(f"❌ Ошибка Telegram: {e}\n{traceback.format_exc()}")
         return False
 
 # ==================== ГЛАВНАЯ ЛОГИКА ====================
@@ -165,7 +176,7 @@ def main():
     chosen_index = -1
     new_link = ""
 
-    # Жесткая ротация с проверкой истории
+    # Жесткая ротация с проверкой истории и авто-перебором
     for i in range(len(RSS_FEEDS)):
         next_index = (last_index + 1 + i) % len(RSS_FEEDS)
         feed_info = RSS_FEEDS[next_index]
@@ -173,7 +184,9 @@ def main():
         
         try:
             feed = feedparser.parse(feed_info['url'])
-            if not feed.entries: continue
+            if not feed.entries: 
+                logger.warning(f"⚠️ Лента {feed_info['name']} пуста.")
+                continue
 
             for entry in feed.entries:
                 link = entry.get('link', '')
@@ -185,7 +198,9 @@ def main():
                 summary = clean_html(entry.get('summary', entry.get('description', '')))
                 
                 ru_title, ru_summary = process_with_gigachat(title, summary)
-                if not ru_title or not ru_summary: continue
+                if not ru_title or not ru_summary: 
+                    logger.warning(f"⚠️ GigaChat не смог обработать '{title}'. Переход к следующей новости.")
+                    continue
 
                 caption_parts = [
                     f"{feed_info['emoji']} <b>{feed_info['title']}</b>",
@@ -210,7 +225,7 @@ def main():
                 break # Нашли статью, выходим из цикла статей
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка парсинга {feed_info['name']}: {e}")
+            logger.error(f"❌ Ошибка парсинга {feed_info['name']}: {e}\n{traceback.format_exc()}")
             
         if content:
             break # Нашли источник, выходим из цикла источников
