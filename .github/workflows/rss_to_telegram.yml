@@ -6,9 +6,10 @@ on:
     - cron: '0 15 * * *'
   workflow_dispatch:
 
+# ВАЖНО: Даем права на запись в репозиторий для сохранения state.json
 permissions:
-  contents: read
-  actions: write
+  contents: write
+  actions: read
 
 jobs:
   send-nature-news:
@@ -17,6 +18,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Обязательно забираем весь репозиторий, чтобы git push сработал
+          fetch-depth: 0 
       
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,6 +38,5 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          # ДОБАВЬТЕ ЭТУ СТРОКУ:
           GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
         run: python main.py
